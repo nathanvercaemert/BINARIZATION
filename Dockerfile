@@ -13,7 +13,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git-lfs \
     libgl1 \
     libglib2.0-0 \
-    libvips \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt
@@ -28,7 +27,7 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
     python -m pip install --no-cache-dir \
     "numpy>=1.22" \
     "opencv-python>=4.5" \
-    "pyvips>=2.2" \
+    "pyvips-binary" \
     "tensorflow<2.13" \
     "sbb-binarization" && \
     python -m pip install --no-cache-dir \
