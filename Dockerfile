@@ -10,6 +10,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     git \
+    git-lfs \
     libgl1 \
     libglib2.0-0 \
     libvips \
@@ -20,6 +21,8 @@ WORKDIR /opt
 RUN git clone --depth 1 --branch "${REPO_REF}" "${REPO_URL}" BINARIZATION
 
 WORKDIR /opt/BINARIZATION
+
+RUN git lfs install && git lfs pull
 
 RUN python -m pip install --upgrade pip setuptools wheel && \
     python -m pip install --no-cache-dir \
