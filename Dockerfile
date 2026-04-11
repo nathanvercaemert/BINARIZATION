@@ -27,6 +27,7 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
     python -m pip install --no-cache-dir \
     "numpy>=1.22" \
     "opencv-python>=4.5" \
+    "pyvips>=2.2" \
     "pyvips-binary" \
     "tensorflow<2.13" \
     "sbb-binarization" && \
