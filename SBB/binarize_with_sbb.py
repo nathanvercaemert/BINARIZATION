@@ -23,6 +23,7 @@ Requires (Python 3.11, TensorFlow < 2.13):
 """
 
 import argparse
+import faulthandler
 import logging
 import os
 import sys
@@ -30,7 +31,6 @@ import sys
 import cv2
 import numpy as np
 import pyvips
-from sbb_binarize.sbb_binarize import SbbBinarizer
 
 logger = logging.getLogger("binarize_with_sbb")
 
@@ -134,6 +134,8 @@ def binarize_image(
 
 
 def main() -> None:
+    faulthandler.enable()
+
     parser = argparse.ArgumentParser(
         description="Binarize CROP-prefixed images using the SBB hybrid "
                     "CNN-Transformer model.  Writes binary masks with "
@@ -156,6 +158,7 @@ def main() -> None:
     args = parser.parse_args()
 
     _configure_logging()
+    logger.info("SBB script startup")
 
     if not os.path.isdir(args.image_dir):
         logger.error("image directory not found: %s", args.image_dir)
@@ -172,8 +175,19 @@ def main() -> None:
 
     verify_crop_prefix(images)
 
+    logger.info("Importing SBB binarization dependency")
+    try:
+        from sbb_binarize.sbb_binarize import SbbBinarizer
+    except Exception:
+        logger.exception("Failed to import SBB binarization dependency")
+        sys.exit(1)
+
     logger.info("Loading SBB binarization model from '%s'", args.model_dir)
-    binarizer = SbbBinarizer(args.model_dir)
+    try:
+        binarizer = SbbBinarizer(args.model_dir)
+    except Exception:
+        logger.exception("Failed to initialize SBB binarization model")
+        sys.exit(1)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
