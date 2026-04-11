@@ -8,12 +8,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     git \
     libgl1 \
     libglib2.0-0 \
     libvips \
-    libvips-dev \
-    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt
