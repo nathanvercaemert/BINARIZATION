@@ -4,7 +4,7 @@ Run DP-LinkNet and SBB binarization in sequence, then merge their outputs.
 This orchestrator treats the existing pipeline scripts as black boxes:
   1. Run DP-LinkNet unchanged on the source images.
   2. Run SBB unchanged on the same source images.
-  3. Combine the resulting binary masks with a pixelwise union.
+  3. Combine the resulting binary masks so black wins at each pixel.
   4. Save archival-quality bilevel TIFF outputs with preserved resolution.
 
 The orchestrator does not modify either pipeline's inference behavior.
@@ -72,7 +72,8 @@ def read_image_mask(path: Path) -> np.ndarray:
     if img.ndim == 3:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    return img > 0
+    # Treat black (0) as foreground so merging preserves any black pixel.
+    return img == 0
 
 
 def read_resolution(path: Path) -> tuple[float | None, float | None]:
@@ -197,7 +198,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         description="Run DP-LinkNet and SBB binarization unchanged, then "
-                    "merge the outputs as a pixelwise union."
+                    "merge the outputs so black wins per pixel."
     )
     parser.add_argument(
         "image_dir",

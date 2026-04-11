@@ -69,4 +69,4 @@ The orchestrator expects:
 - every image filename to start with `CROP`
 - supported image extensions: `.png`, `.jpg`, `.jpeg`, `.tif`, `.tiff`, `.bmp`, `.gif`, `.webp`
 
-The output directory can be empty or missing; the orchestrator will create it if needed and will write merged `BINARY...` TIFF files there.
+The output directory can be empty or missing; the orchestrator will create it if needed and will write merged `BINARY...` TIFF files there. The merge is pixelwise with black winning, so a pixel is black in the final output if either model marks it black.
