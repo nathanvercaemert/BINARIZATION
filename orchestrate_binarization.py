@@ -94,7 +94,9 @@ def save_bilevel_tiff(
 ) -> None:
     import pyvips
 
-    bilevel = (mask.astype(np.uint8) * 255)
+    # `mask` uses True for black pixels, but the TIFF data is encoded as 0=black,
+    # 255=white.
+    bilevel = ((~mask).astype(np.uint8) * 255)
     h, w = bilevel.shape
     vimg = pyvips.Image.new_from_memory(bilevel.data, w, h, 1, "uchar")
     if xres is not None or yres is not None:
