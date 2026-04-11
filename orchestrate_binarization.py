@@ -105,7 +105,11 @@ def save_bilevel_tiff(
     )
 
 
-def run_pipeline(command: list[str], label: str) -> None:
+def run_pipeline(
+    command: list[str],
+    label: str,
+    expected_output_dir: Path | None = None,
+) -> None:
     logger.info("Running %s", label)
     logger.info("Command: %s", " ".join(command))
     completed = subprocess.run(
@@ -114,13 +118,29 @@ def run_pipeline(command: list[str], label: str) -> None:
         capture_output=True,
         text=True,
     )
+    logger.info("%s return code: %d", label, completed.returncode)
     if completed.stdout:
         logger.info("%s stdout:\n%s", label, completed.stdout.rstrip())
     if completed.stderr:
         logger.warning("%s stderr:\n%s", label, completed.stderr.rstrip())
     if completed.returncode != 0:
+        produced = []
+        if expected_output_dir is not None and expected_output_dir.is_dir():
+            produced = sorted(p.name for p in expected_output_dir.iterdir())
+        detail = [
+            f"{label} failed with exit code {completed.returncode}",
+        ]
+        if expected_output_dir is not None:
+            detail.append(
+                f"expected output dir: {expected_output_dir}"
+            )
+            detail.append(
+                f"produced files: {produced if produced else 'none'}"
+            )
+        if not completed.stdout and not completed.stderr:
+            detail.append("subprocess produced no stdout/stderr")
         raise RuntimeError(
-            f"{label} failed with exit code {completed.returncode}"
+            "; ".join(detail)
         )
 
 
@@ -296,6 +316,7 @@ def main() -> None:
 
     dplinknet_command = [
         args.dplinknet_python,
+        "-u",
         str(dplinknet_script),
         str(image_dir),
         str(dp_output_dir),
@@ -312,6 +333,7 @@ def main() -> None:
 
     sbb_command = [
         args.sbb_python,
+        "-u",
         str(sbb_script),
         str(image_dir),
         str(sbb_output_dir),
@@ -323,8 +345,16 @@ def main() -> None:
     logger.info("Intermediate work directory: '%s'", work_dir)
 
     try:
-        run_pipeline(dplinknet_command, "DP-LinkNet pipeline")
-        run_pipeline(sbb_command, "SBB pipeline")
+        run_pipeline(
+            dplinknet_command,
+            "DP-LinkNet pipeline",
+            expected_output_dir=dp_output_dir,
+        )
+        run_pipeline(
+            sbb_command,
+            "SBB pipeline",
+            expected_output_dir=sbb_output_dir,
+        )
         merge_outputs(images, dp_output_dir, sbb_output_dir, output_dir)
     finally:
         if temp_ctx is not None and not args.keep_intermediates:
