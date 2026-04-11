@@ -108,7 +108,16 @@ def save_bilevel_tiff(
 def run_pipeline(command: list[str], label: str) -> None:
     logger.info("Running %s", label)
     logger.info("Command: %s", " ".join(command))
-    completed = subprocess.run(command, check=False)
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.stdout:
+        logger.info("%s stdout:\n%s", label, completed.stdout.rstrip())
+    if completed.stderr:
+        logger.warning("%s stderr:\n%s", label, completed.stderr.rstrip())
     if completed.returncode != 0:
         raise RuntimeError(
             f"{label} failed with exit code {completed.returncode}"
