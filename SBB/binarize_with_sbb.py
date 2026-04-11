@@ -22,6 +22,8 @@ Requires (Python 3.11, TensorFlow < 2.13):
     py -3.11 -m pip install "tensorflow<2.13" sbb-binarization pyvips-binary
 """
 
+from __future__ import annotations
+
 import argparse
 import faulthandler
 import logging
