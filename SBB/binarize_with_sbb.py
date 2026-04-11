@@ -28,7 +28,10 @@ import argparse
 import faulthandler
 import logging
 import os
+from pathlib import Path
+import shutil
 import sys
+import tempfile
 
 import cv2
 import numpy as np
@@ -135,6 +138,33 @@ def binarize_image(
     logger.debug("Saved '%s'", output_path)
 
 
+def prepare_sbb_model_dir(model_dir: str) -> tuple[str, tempfile.TemporaryDirectory | None]:
+    """
+    Normalize model_dir into the shape expected by sbb-binarization.
+
+    The upstream package looks for either:
+    - *.h5 files directly under model_dir, or
+    - child directories under model_dir, each containing a SavedModel.
+
+    This repository stores a single SavedModel directly in model_dir
+    (`saved_model.pb` plus `variables/`). Wrap that layout in a temporary
+    parent directory with one child model folder so the package can find it.
+    """
+    root = Path(model_dir)
+    saved_model_pb = root / "saved_model.pb"
+    saved_model_pbtxt = root / "saved_model.pbtxt"
+
+    if not saved_model_pb.is_file() and not saved_model_pbtxt.is_file():
+        return model_dir, None
+
+    temp_ctx = tempfile.TemporaryDirectory(prefix="sbb_model_compat_")
+    compat_parent = Path(temp_ctx.name)
+    compat_model = compat_parent / root.name
+
+    shutil.copytree(root, compat_model)
+    return str(compat_parent), temp_ctx
+
+
 def main() -> None:
     faulthandler.enable()
 
@@ -184,11 +214,26 @@ def main() -> None:
         logger.exception("Failed to import SBB binarization dependency")
         sys.exit(1)
 
-    logger.info("Loading SBB binarization model from '%s'", args.model_dir)
+    compat_model_ctx = None
+    model_dir_for_sbb = args.model_dir
     try:
-        binarizer = SbbBinarizer(args.model_dir)
+        model_dir_for_sbb, compat_model_ctx = prepare_sbb_model_dir(args.model_dir)
+    except Exception:
+        logger.exception("Failed to prepare SBB model directory")
+        sys.exit(1)
+
+    logger.info("Loading SBB binarization model from '%s'", args.model_dir)
+    if model_dir_for_sbb != args.model_dir:
+        logger.info(
+            "Using normalized SBB model directory '%s' for compatibility",
+            model_dir_for_sbb,
+        )
+    try:
+        binarizer = SbbBinarizer(model_dir_for_sbb)
     except Exception:
         logger.exception("Failed to initialize SBB binarization model")
+        if compat_model_ctx is not None:
+            compat_model_ctx.cleanup()
         sys.exit(1)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -213,6 +258,8 @@ def main() -> None:
         logger.debug("[%d/%d] %s -- OK", idx, total, rel)
 
     binarizer.end_session()
+    if compat_model_ctx is not None:
+        compat_model_ctx.cleanup()
 
     logger.info(
         "Processed %d/%d image(s) successfully.", total - len(failed), total,
