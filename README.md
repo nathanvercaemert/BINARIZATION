@@ -45,6 +45,10 @@ docker run --rm \
   /input /output
 ```
 
+```bash
+docker run --rm -v "C:\Users\natha\OneDrive\Desktop\TEST_IMAGE_PROCESSING\working_slim":/input -v "C:\Users\natha\OneDrive\Desktop\TEST_IMAGE_PROCESSING\binary_slim":/output binarization-orchestrator /input /output
+```
+
 If you want to preserve intermediate pipeline outputs on the host as well:
 
 ```bash
