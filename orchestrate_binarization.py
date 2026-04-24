@@ -13,6 +13,8 @@ The orchestrator does not modify either pipeline's inference behavior.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path
@@ -26,6 +28,16 @@ logger = logging.getLogger("orchestrate_binarization")
 IMAGE_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp",
 }
+
+
+@dataclass(frozen=True)
+class PipelineResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+CommandBuilder = Callable[[Path, Path], list[str]]
 
 
 def _configure_logging() -> None:
@@ -58,8 +70,77 @@ def verify_crop_prefix(images: list[Path]) -> None:
             )
 
 
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be at least 0")
+    return parsed
+
+
 def build_binary_name(image_path: Path) -> str:
     return "BINARY" + image_path.name[4:]
+
+
+def chunked(items: list[Path], size: int) -> Iterable[list[Path]]:
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def validate_image_file(path: Path, full_decode: bool = True) -> str | None:
+    if not path.is_file():
+        return "missing"
+
+    try:
+        import pyvips
+
+        img = pyvips.Image.new_from_file(str(path), access="sequential")
+        if img.width < 1 or img.height < 1:
+            return f"invalid dimensions: {img.width}x{img.height}"
+        if full_decode:
+            # Force libvips to decode the image so truncated outputs are caught
+            # before they are trusted for resume or SIGKILL recovery.
+            img.avg()
+    except Exception as exc:
+        return f"unreadable: {exc}"
+
+    return None
+
+
+def output_validation_failures(
+    images: list[Path],
+    output_dir: Path,
+) -> dict[Path, str]:
+    failures = {}
+    for image_path in images:
+        binary_path = output_dir / build_binary_name(image_path)
+        failure = validate_image_file(binary_path)
+        if failure is not None:
+            failures[image_path] = f"{binary_path}: {failure}"
+    return failures
+
+
+def final_output_is_valid(image_path: Path, output_dir: Path) -> bool:
+    return validate_image_file(output_dir / build_binary_name(image_path)) is None
+
+
+def format_image_names(images: list[Path], limit: int = 8) -> str:
+    names = [p.name for p in images[:limit]]
+    if len(images) > limit:
+        names.append(f"... +{len(images) - limit} more")
+    return ", ".join(names)
 
 
 def read_image_mask(path: Path) -> np.ndarray:
@@ -84,6 +165,65 @@ def read_resolution(path: Path) -> tuple[float | None, float | None]:
     xres = img.get("Xres") if img.get_typeof("Xres") != 0 else None
     yres = img.get("Yres") if img.get_typeof("Yres") != 0 else xres
     return xres, yres
+
+
+def link_source_image(source: Path, destination: Path) -> None:
+    try:
+        os.symlink(source, destination)
+        return
+    except OSError:
+        try:
+            os.link(source, destination)
+            return
+        except OSError as hardlink_exc:
+            raise RuntimeError(
+                "Could not create symlink or hardlink for chunk input "
+                f"'{source}' -> '{destination}'. Use a work directory on a "
+                "filesystem that supports links; copying huge source images is "
+                "intentionally avoided."
+            ) from hardlink_exc
+
+
+def build_chunk_input_dir(chunk_input_dir: Path, images: list[Path]) -> None:
+    chunk_input_dir.mkdir(parents=True, exist_ok=False)
+    for image_path in images:
+        link_source_image(image_path, chunk_input_dir / image_path.name)
+
+
+def prepare_sbb_compat_model_once(
+    sbb_model_dir: Path,
+    work_dir: Path,
+) -> Path:
+    saved_model_pb = sbb_model_dir / "saved_model.pb"
+    saved_model_pbtxt = sbb_model_dir / "saved_model.pbtxt"
+    if not saved_model_pb.is_file() and not saved_model_pbtxt.is_file():
+        return sbb_model_dir
+
+    compat_parent = work_dir / "sbb_model_compat"
+    compat_model = compat_parent / sbb_model_dir.name
+    compat_parent.mkdir(parents=True, exist_ok=True)
+
+    if compat_model.exists():
+        if (
+            (compat_model / "saved_model.pb").is_file()
+            or (compat_model / "saved_model.pbtxt").is_file()
+        ):
+            return compat_parent
+        raise RuntimeError(
+            f"Existing SBB compatibility path is not a SavedModel: "
+            f"{compat_model}"
+        )
+
+    try:
+        os.symlink(sbb_model_dir, compat_model, target_is_directory=True)
+    except OSError:
+        logger.warning(
+            "Could not symlink SBB model into '%s'; copying model once instead",
+            compat_model,
+        )
+        shutil.copytree(sbb_model_dir, compat_model)
+
+    return compat_parent
 
 
 def save_bilevel_tiff(
@@ -111,8 +251,7 @@ def save_bilevel_tiff(
 def run_pipeline(
     command: list[str],
     label: str,
-    expected_output_dir: Path | None = None,
-) -> None:
+) -> PipelineResult:
     logger.info("Running %s", label)
     logger.info("Command: %s", " ".join(command))
     completed = subprocess.run(
@@ -126,24 +265,205 @@ def run_pipeline(
         logger.info("%s stdout:\n%s", label, completed.stdout.rstrip())
     if completed.stderr:
         logger.warning("%s stderr:\n%s", label, completed.stderr.rstrip())
-    if completed.returncode != 0:
-        produced = []
-        if expected_output_dir is not None and expected_output_dir.is_dir():
-            produced = sorted(p.name for p in expected_output_dir.iterdir())
-        detail = [
-            f"{label} failed with exit code {completed.returncode}",
-        ]
-        if expected_output_dir is not None:
-            detail.append(
-                f"expected output dir: {expected_output_dir}"
+    return PipelineResult(
+        completed.returncode,
+        completed.stdout,
+        completed.stderr,
+    )
+
+
+def unlink_failed_outputs(images: list[Path], output_dir: Path) -> None:
+    for image_path in images:
+        output_path = output_dir / build_binary_name(image_path)
+        if output_path.exists():
+            output_path.unlink()
+
+
+def produced_file_names(output_dir: Path) -> list[str]:
+    if not output_dir.is_dir():
+        return []
+    return sorted(p.name for p in output_dir.iterdir())
+
+
+def pipeline_failure_message(
+    label: str,
+    result: PipelineResult,
+    output_dir: Path,
+    failures: dict[Path, str],
+) -> str:
+    details = [
+        f"{label} failed with exit code {result.returncode}",
+        f"expected output dir: {output_dir}",
+        f"produced files: {produced_file_names(output_dir) or 'none'}",
+    ]
+    if result.returncode < 0:
+        details.append(f"subprocess was terminated by signal {-result.returncode}")
+    if failures:
+        details.append(
+            "invalid/missing outputs: "
+            + "; ".join(f"{p.name}: {err}" for p, err in failures.items())
+        )
+    if not result.stdout and not result.stderr:
+        details.append("subprocess produced no stdout/stderr")
+    return "; ".join(details)
+
+
+def process_stage_chunk(
+    images: list[Path],
+    stage_label: str,
+    command_builder: CommandBuilder,
+    output_dir: Path,
+    attempt_root: Path,
+    keep_intermediates: bool,
+    remaining_retries: int,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    attempt_root.mkdir(parents=True, exist_ok=True)
+
+    pending_failures = output_validation_failures(images, output_dir)
+    pending_images = [image_path for image_path in images if image_path in pending_failures]
+    if not pending_images:
+        logger.info(
+            "%s outputs already valid for %d image(s): %s",
+            stage_label,
+            len(images),
+            format_image_names(images),
+        )
+        return
+
+    unlink_failed_outputs(pending_images, output_dir)
+
+    attempt_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f"{stage_label.lower().replace(' ', '_')}_attempt_",
+            dir=attempt_root,
+        )
+    )
+    input_dir = attempt_dir / "input"
+
+    try:
+        build_chunk_input_dir(input_dir, pending_images)
+        result = run_pipeline(
+            command_builder(input_dir, output_dir),
+            f"{stage_label} pipeline",
+        )
+        output_failures = output_validation_failures(pending_images, output_dir)
+
+        if result.returncode == 0 and not output_failures:
+            return
+
+        if result.returncode == -9 and not output_failures:
+            logger.warning(
+                "%s was killed with SIGKILL after producing all expected "
+                "outputs for %d image(s); continuing",
+                stage_label,
+                len(pending_images),
             )
-            detail.append(
-                f"produced files: {produced if produced else 'none'}"
+            return
+
+        if not output_failures:
+            raise RuntimeError(
+                pipeline_failure_message(
+                    stage_label,
+                    result,
+                    output_dir,
+                    output_failures,
+                )
             )
-        if not completed.stdout and not completed.stderr:
-            detail.append("subprocess produced no stdout/stderr")
-        raise RuntimeError(
-            "; ".join(detail)
+
+        retry_images = (
+            [image_path for image_path in pending_images if image_path in output_failures]
+            if output_failures else pending_images
+        )
+
+        if len(pending_images) == 1 or remaining_retries < 1:
+            raise RuntimeError(
+                pipeline_failure_message(
+                    stage_label,
+                    result,
+                    output_dir,
+                    output_failures,
+                )
+            )
+
+        if len(retry_images) == 1:
+            logger.warning(
+                "%s failed for one image inside a larger chunk; retrying %s "
+                "alone",
+                stage_label,
+                retry_images[0].name,
+            )
+            process_stage_chunk(
+                retry_images,
+                stage_label,
+                command_builder,
+                output_dir,
+                attempt_root,
+                keep_intermediates,
+                remaining_retries - 1,
+            )
+            return
+
+        midpoint = max(1, len(retry_images) // 2)
+        logger.warning(
+            "%s failed for %d image(s); retrying as %d and %d image chunk(s)",
+            stage_label,
+            len(retry_images),
+            midpoint,
+            len(retry_images) - midpoint,
+        )
+        process_stage_chunk(
+            retry_images[:midpoint],
+            stage_label,
+            command_builder,
+            output_dir,
+            attempt_root,
+            keep_intermediates,
+            remaining_retries - 1,
+        )
+        process_stage_chunk(
+            retry_images[midpoint:],
+            stage_label,
+            command_builder,
+            output_dir,
+            attempt_root,
+            keep_intermediates,
+            remaining_retries - 1,
+        )
+    finally:
+        if not keep_intermediates:
+            shutil.rmtree(attempt_dir, ignore_errors=True)
+
+
+def process_stage_images(
+    images: list[Path],
+    stage_label: str,
+    command_builder: CommandBuilder,
+    output_dir: Path,
+    attempt_root: Path,
+    chunk_size: int,
+    keep_intermediates: bool,
+    max_retries: int,
+) -> None:
+    stage_chunks = list(chunked(images, chunk_size))
+    total_chunks = len(stage_chunks)
+    for idx, image_chunk in enumerate(stage_chunks, 1):
+        logger.info(
+            "%s chunk %d/%d: %d image(s): %s",
+            stage_label,
+            idx,
+            total_chunks,
+            len(image_chunk),
+            format_image_names(image_chunk),
+        )
+        process_stage_chunk(
+            image_chunk,
+            stage_label,
+            command_builder,
+            output_dir,
+            attempt_root,
+            keep_intermediates,
+            max_retries,
         )
 
 
@@ -179,7 +499,17 @@ def merge_outputs(
 
             union_mask = np.logical_or(dp_mask, sbb_mask)
             xres, yres = read_resolution(image_path)
-            save_bilevel_tiff(union_mask, final_path, xres, yres)
+            temp_final_path = final_path.with_name(
+                f".{final_path.name}.tmp{final_path.suffix}"
+            )
+            if temp_final_path.exists():
+                temp_final_path.unlink()
+            try:
+                save_bilevel_tiff(union_mask, temp_final_path, xres, yres)
+                os.replace(temp_final_path, final_path)
+            finally:
+                if temp_final_path.exists():
+                    temp_final_path.unlink()
         except (FileNotFoundError, RuntimeError, OSError, ValueError) as exc:
             rel = os.path.relpath(image_path, image_path.parent)
             logger.error("[%d/%d] %s -- %s", idx, total, rel, exc)
@@ -261,6 +591,40 @@ def main() -> None:
         action="store_true",
         help="Keep DP-LinkNet and SBB intermediate output directories",
     )
+    parser.add_argument(
+        "--chunk-size",
+        type=positive_int,
+        default=1,
+        help="Default number of source images per orchestrator chunk",
+    )
+    parser.add_argument(
+        "--dplinknet-chunk-size",
+        type=positive_int,
+        default=None,
+        help="Override source images per DP-LinkNet subprocess",
+    )
+    parser.add_argument(
+        "--sbb-chunk-size",
+        type=positive_int,
+        default=None,
+        help="Override source images per SBB subprocess",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=nonnegative_int,
+        default=10,
+        help="Maximum split-retry depth for failed multi-image chunks",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip source images whose final output already exists and is readable",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Reprocess images even when --resume would skip them",
+    )
     args = parser.parse_args()
 
     try:
@@ -304,69 +668,141 @@ def main() -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    original_image_count = len(images)
+    if args.resume and not args.force:
+        skipped = [
+            image_path
+            for image_path in images
+            if final_output_is_valid(image_path, output_dir)
+        ]
+        skipped_set = set(skipped)
+        images = [image_path for image_path in images if image_path not in skipped_set]
+        logger.info(
+            "Resume enabled: skipping %d/%d image(s) with valid final outputs",
+            len(skipped),
+            original_image_count,
+        )
+        if not images:
+            logger.info("No images require processing.")
+            return
+
     temp_ctx = None
     if args.work_dir is None:
-        temp_ctx = tempfile.TemporaryDirectory(prefix="binarization_orchestrator_")
-        work_dir = Path(temp_ctx.name)
+        if args.keep_intermediates:
+            work_dir = Path(tempfile.mkdtemp(prefix="binarization_orchestrator_"))
+        else:
+            temp_ctx = tempfile.TemporaryDirectory(prefix="binarization_orchestrator_")
+            work_dir = Path(temp_ctx.name)
     else:
         work_dir = Path(args.work_dir).resolve()
         work_dir.mkdir(parents=True, exist_ok=True)
 
-    dp_output_dir = work_dir / "dplinknet_output"
-    sbb_output_dir = work_dir / "sbb_output"
-    dp_output_dir.mkdir(parents=True, exist_ok=True)
-    sbb_output_dir.mkdir(parents=True, exist_ok=True)
+    sbb_compat_existed = (work_dir / "sbb_model_compat").exists()
+    sbb_model_for_runs = prepare_sbb_compat_model_once(sbb_model_dir, work_dir)
+    cleanup_paths: list[Path] = []
+    if (
+        temp_ctx is None
+        and sbb_model_for_runs != sbb_model_dir
+        and not sbb_compat_existed
+    ):
+        cleanup_paths.append(sbb_model_for_runs)
 
-    dplinknet_command = [
-        args.dplinknet_python,
-        "-u",
-        str(dplinknet_script),
-        str(image_dir),
-        str(dp_output_dir),
-        str(dplinknet_weights_dir),
-        "--dataset",
-        args.dataset,
-        "--model",
-        args.model,
-    ]
-    if args.no_tta:
-        dplinknet_command.append("--no-tta")
-    if args.threshold is not None:
-        dplinknet_command.extend(["--threshold", str(args.threshold)])
+    dp_chunk_size = args.dplinknet_chunk_size or args.chunk_size
+    sbb_chunk_size = args.sbb_chunk_size or args.chunk_size
+    group_chunk_size = max(dp_chunk_size, sbb_chunk_size)
 
-    sbb_command = [
-        args.sbb_python,
-        "-u",
-        str(sbb_script),
-        str(image_dir),
-        str(sbb_output_dir),
-        str(sbb_model_dir),
-    ]
+    def build_dplinknet_command(input_dir: Path, output_dir_for_stage: Path) -> list[str]:
+        command = [
+            args.dplinknet_python,
+            "-u",
+            str(dplinknet_script),
+            str(input_dir),
+            str(output_dir_for_stage),
+            str(dplinknet_weights_dir),
+            "--dataset",
+            args.dataset,
+            "--model",
+            args.model,
+        ]
+        if args.no_tta:
+            command.append("--no-tta")
+        if args.threshold is not None:
+            command.extend(["--threshold", str(args.threshold)])
+        return command
 
-    logger.info("Found %d input image(s) in '%s'", len(images), image_dir)
+    def build_sbb_command(input_dir: Path, output_dir_for_stage: Path) -> list[str]:
+        return [
+            args.sbb_python,
+            "-u",
+            str(sbb_script),
+            str(input_dir),
+            str(output_dir_for_stage),
+            str(sbb_model_for_runs),
+        ]
+
+    logger.info("Found %d input image(s) in '%s'", original_image_count, image_dir)
+    logger.info("Processing %d image(s) in this run", len(images))
     logger.info("Final output directory: '%s'", output_dir)
     logger.info("Intermediate work directory: '%s'", work_dir)
+    logger.info(
+        "Chunk sizes: orchestrator=%d, DP-LinkNet=%d, SBB=%d",
+        group_chunk_size,
+        dp_chunk_size,
+        sbb_chunk_size,
+    )
 
+    processed_count = 0
     try:
-        run_pipeline(
-            dplinknet_command,
-            "DP-LinkNet pipeline",
-            expected_output_dir=dp_output_dir,
-        )
-        run_pipeline(
-            sbb_command,
-            "SBB pipeline",
-            expected_output_dir=sbb_output_dir,
-        )
-        merge_outputs(images, dp_output_dir, sbb_output_dir, output_dir)
+        image_chunks = list(chunked(images, group_chunk_size))
+        for chunk_idx, image_chunk in enumerate(image_chunks, 1):
+            chunk_root = Path(
+                tempfile.mkdtemp(prefix=f"chunk_{chunk_idx:05d}_", dir=work_dir)
+            )
+            try:
+                logger.info(
+                    "Orchestrator chunk %d/%d: %d image(s): %s",
+                    chunk_idx,
+                    len(image_chunks),
+                    len(image_chunk),
+                    format_image_names(image_chunk),
+                )
+                dp_output_dir = chunk_root / "dplinknet_output"
+                sbb_output_dir = chunk_root / "sbb_output"
+                attempt_root = chunk_root / "attempts"
+
+                process_stage_images(
+                    image_chunk,
+                    "DP-LinkNet",
+                    build_dplinknet_command,
+                    dp_output_dir,
+                    attempt_root,
+                    dp_chunk_size,
+                    args.keep_intermediates,
+                    args.max_retries,
+                )
+                process_stage_images(
+                    image_chunk,
+                    "SBB",
+                    build_sbb_command,
+                    sbb_output_dir,
+                    attempt_root,
+                    sbb_chunk_size,
+                    args.keep_intermediates,
+                    args.max_retries,
+                )
+                merge_outputs(image_chunk, dp_output_dir, sbb_output_dir, output_dir)
+                processed_count += len(image_chunk)
+            finally:
+                if not args.keep_intermediates:
+                    shutil.rmtree(chunk_root, ignore_errors=True)
     finally:
         if temp_ctx is not None and not args.keep_intermediates:
             temp_ctx.cleanup()
         elif temp_ctx is None and not args.keep_intermediates:
-            shutil.rmtree(dp_output_dir, ignore_errors=True)
-            shutil.rmtree(sbb_output_dir, ignore_errors=True)
+            for cleanup_path in cleanup_paths:
+                shutil.rmtree(cleanup_path, ignore_errors=True)
 
-    logger.info("Merged %d image(s) successfully.", len(images))
+    logger.info("Merged %d image(s) successfully.", processed_count)
 
 
 if __name__ == "__main__":

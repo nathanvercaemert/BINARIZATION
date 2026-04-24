@@ -60,6 +60,22 @@ docker run --rm \
   /input /output --work-dir /work --keep-intermediates
 ```
 
+For very large batches or very large source images, keep the SBB subprocess
+small so TensorFlow memory is released between images:
+
+```bash
+docker run --rm \
+  -v /absolute/path/to/input:/input \
+  -v /absolute/path/to/output:/output \
+  -v /absolute/path/to/work:/work \
+  binarization-orchestrator \
+  /input /output --work-dir /work --sbb-chunk-size 1 --resume
+```
+
+The orchestrator processes full-resolution source images through the same
+DP-LinkNet and SBB scripts; chunking only changes subprocess boundaries and
+does not resize, downsample, or otherwise alter model inference.
+
 ## Input Directory Requirements
 
 The orchestrator expects:
