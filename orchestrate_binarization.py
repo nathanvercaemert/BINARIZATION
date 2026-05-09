@@ -272,6 +272,33 @@ def run_pipeline(
     )
 
 
+def normalize_cuda_device_for_preflight(device: str) -> str:
+    if device in {"auto", "cuda"}:
+        return "cuda:0"
+    if device.startswith("cuda:"):
+        return device
+    return "cuda:0"
+
+
+def run_gpu_preflight(preflight_script: Path, device: str) -> None:
+    if not preflight_script.is_file():
+        raise SystemExit(f"GPU preflight script not found: {preflight_script}")
+
+    command = [
+        sys.executable,
+        "-u",
+        str(preflight_script),
+        "--device",
+        normalize_cuda_device_for_preflight(device),
+    ]
+    logger.info("Running GPU preflight check")
+    completed = subprocess.run(command, check=False)
+    if completed.returncode != 0:
+        raise SystemExit(
+            f"GPU preflight failed with exit code {completed.returncode}"
+        )
+
+
 def unlink_failed_outputs(images: list[Path], output_dir: Path) -> None:
     for image_path in images:
         output_path = output_dir / build_binary_name(image_path)
@@ -534,10 +561,12 @@ def main() -> None:
     )
     parser.add_argument(
         "image_dir",
+        nargs="?",
         help="Directory containing CROP-prefixed source images",
     )
     parser.add_argument(
         "output_dir",
+        nargs="?",
         help="Directory to write final merged BINARY-prefixed TIFF outputs",
     )
     parser.add_argument(
@@ -570,6 +599,24 @@ def main() -> None:
         type=float,
         default=None,
         help="Optional DP-LinkNet threshold override",
+    )
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        help=(
+            "Device for DP-LinkNet inference: cuda, cuda:N, auto, or cpu "
+            "(default: cuda)"
+        ),
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Run the GPU preflight check and exit before image/model processing",
+    )
+    parser.add_argument(
+        "--skip-gpu-preflight",
+        action="store_true",
+        help="Skip the startup GPU preflight check",
     )
     parser.add_argument(
         "--dplinknet-python",
@@ -627,6 +674,19 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    _configure_logging()
+
+    root_dir = Path(__file__).resolve().parent
+    preflight_script = root_dir / "gpu_preflight.py"
+
+    if args.preflight_only or not args.skip_gpu_preflight:
+        run_gpu_preflight(preflight_script, args.device)
+        if args.preflight_only:
+            return
+
+    if args.image_dir is None or args.output_dir is None:
+        parser.error("image_dir and output_dir are required unless --preflight-only is used")
+
     try:
         import cv2  # noqa: F401
         import numpy as np  # noqa: F401
@@ -638,9 +698,6 @@ def main() -> None:
             "write TIFF masks before running this script."
         ) from exc
 
-    _configure_logging()
-
-    root_dir = Path(__file__).resolve().parent
     image_dir = Path(args.image_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
     dplinknet_weights_dir = Path(args.dplinknet_weights_dir).resolve()
@@ -723,6 +780,8 @@ def main() -> None:
             args.dataset,
             "--model",
             args.model,
+            "--device",
+            args.device,
         ]
         if args.no_tta:
             command.append("--no-tta")

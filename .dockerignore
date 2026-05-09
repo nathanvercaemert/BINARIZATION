@@ -1,0 +1,4 @@
+.codex
+.git
+__pycache__/
+*.py[cod]

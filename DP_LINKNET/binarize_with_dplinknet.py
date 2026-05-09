@@ -25,7 +25,7 @@ Usage:
     python binarize_with_dplinknet.py <image_dir> <output_dir> <weights_dir> --dataset dibco --no-tta
 
 Requires (Python >= 3.9):
-    pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
     pip install "opencv-python>=4.5" "numpy>=1.22" pyvips
 """
 
@@ -68,6 +68,56 @@ TTA_THRESHOLD = 5.0
 SINGLE_THRESHOLD = 0.5
 
 
+def resolve_device(device_arg: str) -> torch.device:
+    """Resolve the requested inference device without silent CPU fallback."""
+    requested = device_arg.lower()
+    if requested == "cpu":
+        logger.warning("Using CPU because --device cpu was explicitly requested")
+        return torch.device("cpu")
+
+    if requested == "auto":
+        requested = "cuda"
+
+    if requested == "cuda":
+        requested = "cuda:0"
+
+    if requested.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested but PyTorch reports CUDA unavailable. "
+                "Use --device cpu only for an intentional CPU baseline run."
+            )
+
+        try:
+            device = torch.device(requested)
+        except RuntimeError as exc:
+            raise ValueError(f"invalid CUDA device: {device_arg}") from exc
+
+        device_index = device.index if device.index is not None else 0
+        device_count = torch.cuda.device_count()
+        if device_index < 0 or device_index >= device_count:
+            raise ValueError(
+                f"CUDA device index {device_index} is out of range for "
+                f"{device_count} visible CUDA device(s)"
+            )
+
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+        logger.info(
+            "Using CUDA device %s: %s",
+            device,
+            torch.cuda.get_device_name(device_index),
+        )
+        return device
+
+    raise ValueError(
+        f"invalid device '{device_arg}'. Expected cuda, cuda:N, auto, or cpu."
+    )
+
+
 def collect_images(directory: str) -> list[str]:
     """Return sorted list of image file paths in *directory*."""
     files = []
@@ -94,8 +144,12 @@ def build_binary_path(image_path: str, output_root: str) -> str:
     return os.path.join(output_root, binary_name)
 
 
-def load_model(weights_path: str, model_name: str) -> torch.nn.Module:
-    """Instantiate the model, load weights on CPU, and set to eval mode."""
+def load_model(
+    weights_path: str,
+    model_name: str,
+    device: torch.device,
+) -> torch.nn.Module:
+    """Instantiate the model, load weights on CPU, move to device, and eval."""
     if model_name not in MODEL_REGISTRY:
         logger.error(
             "unknown model '%s'. Choose from: %s",
@@ -128,6 +182,7 @@ def load_model(weights_path: str, model_name: str) -> torch.nn.Module:
         )
         raise
 
+    model.to(device)
     model.eval()
     return model
 
@@ -156,15 +211,23 @@ def preprocess_tile(tile: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(x)
 
 
-def predict_tile(model: torch.nn.Module, tile: np.ndarray) -> np.ndarray:
+def predict_tile(
+    model: torch.nn.Module,
+    tile: np.ndarray,
+    device: torch.device,
+) -> np.ndarray:
     """Run a single forward pass on one tile.  Returns HW float32 map."""
-    tensor = preprocess_tile(tile).unsqueeze(0)
-    with torch.no_grad():
+    tensor = preprocess_tile(tile).unsqueeze(0).to(device)
+    with torch.inference_mode():
         out = model(tensor)
-    return out.squeeze().cpu().numpy()
+    return out.squeeze().detach().cpu().numpy()
 
 
-def predict_tile_tta(model: torch.nn.Module, tile: np.ndarray) -> np.ndarray:
+def predict_tile_tta(
+    model: torch.nn.Module,
+    tile: np.ndarray,
+    device: torch.device,
+) -> np.ndarray:
     """Run batched 8-view TTA on one tile.  Returns summed HW float32 map."""
     t = tile.transpose(1, 0, 2)
 
@@ -179,9 +242,9 @@ def predict_tile_tta(model: torch.nn.Module, tile: np.ndarray) -> np.ndarray:
         np.flip(np.flip(t, 0), 1).copy(),             # 7: transpose + hvflip
     ]
 
-    batch = torch.stack([preprocess_tile(v) for v in views])
-    with torch.no_grad():
-        preds = model(batch).squeeze(1).cpu().numpy()
+    batch = torch.stack([preprocess_tile(v) for v in views]).to(device)
+    with torch.inference_mode():
+        preds = model(batch).squeeze(1).detach().cpu().numpy()
 
     # Invert each augmentation to align predictions back to original orientation
     preds[1] = np.flip(preds[1], 1)
@@ -219,6 +282,7 @@ def binarize_image(
     image_path: str,
     output_path: str,
     model: torch.nn.Module,
+    device: torch.device,
     tta: bool,
     threshold: float,
 ) -> None:
@@ -260,9 +324,9 @@ def binarize_image(
             tile = img_padded[y:y + TILE_SIZE, x:x + TILE_SIZE]
 
             if tta:
-                pred = predict_tile_tta(model, tile)
+                pred = predict_tile_tta(model, tile, device)
             else:
-                pred = predict_tile(model, tile)
+                pred = predict_tile(model, tile, device)
 
             inner = pred[PADDING_SIZE:PADDING_SIZE + stride,
                          PADDING_SIZE:PADDING_SIZE + stride]
@@ -316,6 +380,14 @@ def main() -> None:
         help="Override binarization threshold (default: 5.0 with TTA, "
              "0.5 without TTA)",
     )
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        help=(
+            "Inference device: cuda, cuda:N, auto, or cpu. The default is "
+            "cuda and will fail if CUDA is unavailable."
+        ),
+    )
     args = parser.parse_args()
 
     _configure_logging()
@@ -352,8 +424,14 @@ def main() -> None:
     else:
         threshold = TTA_THRESHOLD if tta else SINGLE_THRESHOLD
 
+    try:
+        device = resolve_device(args.device)
+    except (RuntimeError, ValueError) as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
+
     logger.info("Loading model '%s' from '%s'", args.model, weights_path)
-    model = load_model(weights_path, args.model)
+    model = load_model(weights_path, args.model, device)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -363,6 +441,7 @@ def main() -> None:
 
     logger.info("Found %d image(s) under '%s'", total, args.image_dir)
     logger.info("Output directory: '%s'", args.output_dir)
+    logger.info("Device: %s", device)
     logger.info("Mode: %s, threshold: %s", mode_label, threshold)
 
     for idx, image_path in enumerate(images, 1):
@@ -370,7 +449,7 @@ def main() -> None:
         output_path = build_binary_path(image_path, args.output_dir)
 
         try:
-            binarize_image(image_path, output_path, model, tta, threshold)
+            binarize_image(image_path, output_path, model, device, tta, threshold)
         except (RuntimeError, OSError, ValueError) as e:
             logger.error("[%d/%d] %s -- %s", idx, total, rel, e)
             failed.append((rel, str(e)))

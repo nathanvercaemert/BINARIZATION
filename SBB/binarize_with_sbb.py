@@ -165,6 +165,30 @@ def prepare_sbb_model_dir(model_dir: str) -> tuple[str, tempfile.TemporaryDirect
     return str(compat_parent), temp_ctx
 
 
+def configure_tensorflow_gpu() -> None:
+    """Log TensorFlow GPU visibility and use incremental GPU memory allocation."""
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+    os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
+
+    import tensorflow as tf
+
+    gpus = tf.config.list_physical_devices("GPU")
+    if not gpus:
+        logger.warning("TensorFlow reports no visible GPU devices")
+        return
+
+    for gpu in gpus:
+        try:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as exc:
+            logger.warning("Could not set memory growth for %s: %s", gpu.name, exc)
+
+    logger.info(
+        "TensorFlow GPU device(s): %s",
+        ", ".join(gpu.name for gpu in gpus),
+    )
+
+
 def main() -> None:
     faulthandler.enable()
 
@@ -207,9 +231,25 @@ def main() -> None:
 
     verify_crop_prefix(images)
 
+    logger.info("Checking TensorFlow GPU visibility")
+    try:
+        configure_tensorflow_gpu()
+    except Exception:
+        logger.exception("Failed to configure TensorFlow GPU visibility")
+        sys.exit(1)
+
     logger.info("Importing SBB binarization dependency")
     try:
-        from sbb_binarize.sbb_binarize import SbbBinarizer
+        import sbb_binarize.sbb_binarize as sbb_module
+
+        if not hasattr(sbb_module.tensorflow_backend, "set_session"):
+            logger.warning(
+                "SBB TensorFlow backend has no set_session; using no-op "
+                "compatibility shim"
+            )
+            sbb_module.tensorflow_backend.set_session = lambda session: None
+
+        SbbBinarizer = sbb_module.SbbBinarizer
     except Exception:
         logger.exception("Failed to import SBB binarization dependency")
         sys.exit(1)

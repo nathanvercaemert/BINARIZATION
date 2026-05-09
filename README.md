@@ -3,60 +3,57 @@
 This repository can be packaged into a portable Docker image that:
 
 - installs the runtime dependencies for the orchestrator and both model pipelines
-- downloads this repository during the image build so the code, weights, and SBB model are baked into the image
-- can then be run with bind-mounted input and output directories
+- copies the current checkout during the image build so the code, weights, and SBB model are baked into the image
+- can then be run on a GPU-enabled Docker host with bind-mounted input and output directories
 
 ## Dockerfile
 
-Use the root-level [Dockerfile](/mnt/c/Users/natha/OneDrive/Desktop/BINARIZATION/Dockerfile). It clones this repository during image build so the code, weights, and model assets are baked into the image.
+Use the root-level [Dockerfile](/mnt/c/Users/natha/OneDrive/Desktop/BINARIZATION/Dockerfile). It copies the current checkout during image build so the code, weights, and model assets are baked into the image. Make sure Git LFS files are present locally before building.
 
 ## Build
 
 Build the image:
 
 ```bash
-docker build -t binarization-orchestrator .
+docker build -t binarization-orchestrator:gpu .
 ```
 
 Build it from scratch with no cache:
 
 ```bash
-docker build --no-cache -t binarization-orchestrator .
+docker build --no-cache -t binarization-orchestrator:gpu .
 ```
 
-If you want to pin a different repository or ref at build time:
-
-```bash
-docker build \
-  --build-arg REPO_URL=https://github.com/nathanvercaemert/BINARIZATION.git \
-  --build-arg REPO_REF=main \
-  -t binarization-orchestrator .
-```
+If you want to build a different ref, check out that ref and run `git lfs pull`
+before building.
 
 ## Run
+
+Run the GPU preflight check first. This loads no model files and does not
+process images:
+
+```bash
+docker run --rm --gpus all binarization-orchestrator:gpu --preflight-only
+```
 
 Bind-mount a host input directory and output directory, then pass those mount points to the orchestrator:
 
 ```bash
-docker run --rm \
-  -v /absolute/path/to/input:/input \
-  -v /absolute/path/to/output:/output \
-  binarization-orchestrator \
-  /input /output
+docker run --rm --gpus all -v /mnt/PRIMARY/PRIMARY/BINARIZATION/working_slim:/input -v /mnt/PRIMARY/PRIMARY/BINARIZATION/binary_slim:/output binarization-orchestrator:gpu /input /output
 ```
 
 ```bash
-docker run --rm -v "C:\Users\natha\OneDrive\Desktop\TEST_IMAGE_PROCESSING\working_slim":/input -v "C:\Users\natha\OneDrive\Desktop\TEST_IMAGE_PROCESSING\binary_slim":/output binarization-orchestrator /input /output
+docker run --rm --gpus all -v "C:\Users\natha\OneDrive\Desktop\TEST_IMAGE_PROCESSING\working_slim":/input -v "C:\Users\natha\OneDrive\Desktop\TEST_IMAGE_PROCESSING\binary_slim":/output binarization-orchestrator:gpu /input /output --resume
 ```
 
 If you want to preserve intermediate pipeline outputs on the host as well:
 
 ```bash
-docker run --rm \
+docker run --rm --gpus all \
   -v /absolute/path/to/input:/input \
   -v /absolute/path/to/output:/output \
   -v /absolute/path/to/work:/work \
-  binarization-orchestrator \
+  binarization-orchestrator:gpu \
   /input /output --work-dir /work --keep-intermediates
 ```
 
@@ -64,17 +61,24 @@ For very large batches or very large source images, keep the SBB subprocess
 small so TensorFlow memory is released between images:
 
 ```bash
-docker run --rm \
+docker run --rm --gpus all \
   -v /absolute/path/to/input:/input \
   -v /absolute/path/to/output:/output \
   -v /absolute/path/to/work:/work \
-  binarization-orchestrator \
+  binarization-orchestrator:gpu \
   /input /output --work-dir /work --sbb-chunk-size 1 --resume
 ```
 
 The orchestrator processes full-resolution source images through the same
 DP-LinkNet and SBB scripts; chunking only changes subprocess boundaries and
 does not resize, downsample, or otherwise alter model inference.
+
+To move the image to another machine:
+
+```bash
+docker save binarization-orchestrator:gpu -o binarization-orchestrator-gpu.tar
+docker load -i binarization-orchestrator-gpu.tar
+```
 
 ## Input Directory Requirements
 
